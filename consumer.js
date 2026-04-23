@@ -1,11 +1,13 @@
 require('dotenv').config();
 const amqp = require('amqplib');
 const mongoose = require('mongoose');
-const Inventory = require('./models/Inventory');
+const Product = require('./models/Product');
 
 const rabbitmqUrl = process.env.RABBITMQ_URL;
 const mongoUri = process.env.MONGO_URI;
-const queueName = process.env.QUEUE_NAME || 'product.created';
+
+const exchangeName = process.env.EXCHANGE_NAME || 'order.created';
+const queueName = process.env.QUEUE_NAME || 'inventory.queue';
 
 async function startConsumer() {
   try {
@@ -15,36 +17,49 @@ async function startConsumer() {
     const connection = await amqp.connect(rabbitmqUrl);
     const channel = await connection.createChannel();
 
+    await channel.assertExchange(exchangeName, 'fanout', { durable: true });
     await channel.assertQueue(queueName, { durable: true });
+    await channel.bindQueue(queueName, exchangeName, '');
 
     console.log('Connected to RabbitMQ');
     console.log(`Waiting for messages in queue: ${queueName}`);
 
     channel.consume(queueName, async (message) => {
-      if (message) {
-        const content = message.content.toString();
-        console.log('Received message:', content);
+      if (!message) return;
 
-        try {
-          const product = JSON.parse(content);
+      const content = message.content.toString();
+      console.log('Received message:', content);
 
-          const inventory = new Inventory({
-            productId: product._id,
-            sku: product.sku,
-            stock: product.stock || 0
-          });
+      try {
+        const order = JSON.parse(content);
 
-          await inventory.save();
-          console.log('Inventory record created:', inventory.sku);
-        } catch (error) {
-          console.error('Error processing message:', error.message);
+        if (!order.items || !Array.isArray(order.items)) {
+          throw new Error('Invalid order message: items array is missing');
+        }
+
+        for (const item of order.items) {
+          const updatedProduct = await Product.findOneAndUpdate(
+            { sku: item.sku },
+            { $inc: { stock: -item.quantity } },
+            { new: true }
+          );
+
+          if (updatedProduct) {
+            console.log(`Stock updated for ${item.sku}: ${updatedProduct.stock}`);
+          } else {
+            console.log(`Product not found for sku: ${item.sku}`);
+          }
         }
 
         channel.ack(message);
+      } catch (error) {
+        console.error('Error processing message:', error.message);
+        channel.nack(message, false, false);
       }
     });
   } catch (error) {
     console.error('Consumer error:', error.message);
+    process.exit(1);
   }
 }
 
